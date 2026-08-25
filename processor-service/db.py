@@ -4,11 +4,11 @@ from google.cloud.sql.connector import Connector
 
 INSTANCE_CONNECTION_NAME = os.environ["INSTANCE_CONNECTION_NAME"]  # "project:region:instance"
 DB_USER = os.environ["DB_USER"]
-DB_PASSWORD = os.environ["DB_PASSWORD"]  # viene de Secret Manager via --set-secrets, no hardcodeado
+DB_PASSWORD = os.environ["DB_PASSWORD"]  # comes from Secret Manager via --set-secrets, never hardcoded
 DB_NAME = os.environ["DB_NAME"]
 
-# Connector reutilizado entre requests: abre un tunel autenticado con mTLS
-# a Cloud SQL sin necesitar IP publica en la instancia ni un proxy sidecar.
+# Connector reused across requests: opens an mTLS-authenticated tunnel to
+# Cloud SQL without needing a public IP on the instance or a proxy sidecar.
 _connector = Connector()
 
 

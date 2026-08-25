@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Deploy completo del stack a GCP. Pensado para correr por bloques la primera
-# vez (revisá la salida de cada paso), no como un script "y listo".
+# Full stack deploy to GCP. Meant to be run block by block the first time
+# (review each step's output), not as a "run it and forget it" script.
 set -euo pipefail
 
-: "${PROJECT_ID:?Seteá PROJECT_ID primero: export PROJECT_ID=tu-proyecto-gcp}"
+: "${PROJECT_ID:?Set PROJECT_ID first: export PROJECT_ID=your-gcp-project}"
 REGION="${REGION:-us-central1}"
 INSTANCE_NAME="${INSTANCE_NAME:-records-db}"
 DB_NAME="${DB_NAME:-records}"
@@ -13,7 +13,7 @@ SUBSCRIPTION_ID="${SUBSCRIPTION_ID:-records-ingested-push}"
 
 gcloud config set project "$PROJECT_ID"
 
-echo "== 1/8: habilitando APIs =="
+echo "== 1/8: enabling APIs =="
 gcloud services enable \
   run.googleapis.com \
   sqladmin.googleapis.com \
@@ -21,32 +21,33 @@ gcloud services enable \
   secretmanager.googleapis.com \
   cloudbuild.googleapis.com
 
-echo "== 2/8: Cloud SQL Postgres (tarda varios minutos la primera vez) =="
-# OJO CON EL COSTO: a diferencia de DynamoDB, Cloud SQL NO tiene free tier
-# permanente. db-f1-micro son centavos/dolares por dia, no gratis. Cuando
-# termines de probar: gcloud sql instances patch "$INSTANCE_NAME" --activation-policy=NEVER
-# o directamente borrala con gcloud sql instances delete.
+echo "== 2/8: Cloud SQL Postgres (takes a few minutes the first time) =="
+# COST WARNING: unlike DynamoDB, Cloud SQL has NO permanent free tier.
+# db-f1-micro runs a few cents/dollars per day, not free. When you're done
+# testing: gcloud sql instances patch "$INSTANCE_NAME" --activation-policy=NEVER
+# or delete it outright with gcloud sql instances delete.
 if ! gcloud sql instances describe "$INSTANCE_NAME" >/dev/null 2>&1; then
   gcloud sql instances create "$INSTANCE_NAME" \
     --database-version=POSTGRES_15 \
     --tier=db-f1-micro \
     --region="$REGION"
-    # Con IP publica (default) a proposito: el Cloud SQL Python Connector
-    # autentica via IAM + mTLS sin depender de "authorized networks", y asi
-    # evitamos necesitar un VPC Access Connector solo para este challenge.
+    # Public IP (default) on purpose: the Cloud SQL Python Connector
+    # authenticates via IAM + mTLS without depending on "authorized
+    # networks", which avoids needing a VPC Access Connector just for
+    # this project.
 fi
 
 DB_PASSWORD="$(openssl rand -base64 24)"
 gcloud sql users create "$DB_USER" --instance="$INSTANCE_NAME" --password="$DB_PASSWORD" 2>/dev/null || true
 gcloud sql databases create "$DB_NAME" --instance="$INSTANCE_NAME" 2>/dev/null || true
 
-echo "== 3/8: password en Secret Manager (nunca en texto plano en Cloud Run) =="
+echo "== 3/8: password in Secret Manager (never plaintext in Cloud Run) =="
 printf '%s' "$DB_PASSWORD" | gcloud secrets create db-password --data-file=- 2>/dev/null \
   || printf '%s' "$DB_PASSWORD" | gcloud secrets versions add db-password --data-file=-
 
-# La cuenta de servicio por defecto de Cloud Run (PROJECT_NUMBER-compute@...) no
-# tiene acceso a los secrets por default — hay que otorgárselo explícitamente,
-# si no el deploy falla al crear la revisión con "Permission denied on secret".
+# Cloud Run's default service account (PROJECT_NUMBER-compute@...) has no
+# access to secrets by default — it needs to be granted explicitly, or the
+# deploy fails when creating the revision with "Permission denied on secret".
 PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
 gcloud secrets add-iam-policy-binding db-password \
   --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
@@ -54,17 +55,17 @@ gcloud secrets add-iam-policy-binding db-password \
 
 INSTANCE_CONNECTION_NAME="$(gcloud sql instances describe "$INSTANCE_NAME" --format='value(connectionName)')"
 
-echo "== 4/8: cargá db/schema.sql =="
-echo "Paso manual (una sola vez): abrí Cloud SQL Studio en la consola de GCP"
-echo "para la instancia '$INSTANCE_NAME', conectate a la DB '$DB_NAME' y"
-echo "pegá el contenido de db/schema.sql. Segui cuando lo hayas hecho."
-read -rp "Presioná Enter cuando el schema ya este creado... "
+echo "== 4/8: load db/schema.sql =="
+echo "Manual step (one time only): open Cloud SQL Studio in the GCP console"
+echo "for instance '$INSTANCE_NAME', connect to database '$DB_NAME', and"
+echo "paste the contents of db/schema.sql. Continue once you've done that."
+read -rp "Press Enter once the schema has been created... "
 
 echo "== 5/8: Pub/Sub topic =="
 gcloud pubsub topics create "$TOPIC_ID" 2>/dev/null || true
 
-echo "== 6/8: deploy de processor-service =="
-# --source builda con Cloud Build (no hace falta Docker instalado localmente)
+echo "== 6/8: deploy processor-service =="
+# --source builds with Cloud Build (no need for Docker installed locally)
 gcloud run deploy processor-service \
   --source=./processor-service \
   --region="$REGION" \
@@ -75,13 +76,13 @@ gcloud run deploy processor-service \
 
 PROCESSOR_URL="$(gcloud run services describe processor-service --region="$REGION" --format='value(status.url)')"
 
-# Redeploy de config solo para fijar SERVICE_URL: no se conoce la URL real
-# hasta que el servicio existe (se usa como "audience" del token OIDC).
+# Redeploy the config just to set the real SERVICE_URL: the URL isn't known
+# until the service exists (it's used as the OIDC token's "audience").
 gcloud run services update processor-service \
   --region="$REGION" \
   --set-env-vars="INSTANCE_CONNECTION_NAME=$INSTANCE_CONNECTION_NAME,DB_USER=$DB_USER,DB_NAME=$DB_NAME,SERVICE_URL=$PROCESSOR_URL"
 
-echo "== 7/8: identidad para que Pub/Sub llame al processor con OIDC =="
+echo "== 7/8: identity for Pub/Sub to call the processor via OIDC =="
 PUSH_SA="pubsub-push-invoker@${PROJECT_ID}.iam.gserviceaccount.com"
 gcloud iam service-accounts create pubsub-push-invoker \
   --display-name="Pub/Sub push invoker" 2>/dev/null || true
@@ -97,13 +98,14 @@ gcloud pubsub subscriptions create "$SUBSCRIPTION_ID" \
   --push-auth-service-account="$PUSH_SA" \
   --push-auth-token-audience="$PROCESSOR_URL" \
   --ack-deadline=30 2>/dev/null || true
-  # OJO: sin --push-auth-token-audience, el audience del token OIDC que genera
-  # Pub/Sub por default es la URL COMPLETA del push-endpoint (con /pubsub/push
-  # incluido), no el origen del servicio. Como processor-service/main.py valida
-  # el audience contra SERVICE_URL (sin el path), sin este flag todo push
-  # llega con 401 aunque el resto de la config esté bien.
+  # NOTE: without --push-auth-token-audience, the audience claim on the OIDC
+  # token Pub/Sub generates defaults to the FULL push-endpoint URL
+  # (including /pubsub/push), not the service's origin. Since
+  # processor-service/main.py validates the audience against SERVICE_URL
+  # (no path), every push returns 401 without this flag even though the
+  # rest of the config is correct.
 
-echo "== 8/8: deploy de ingest-service =="
+echo "== 8/8: deploy ingest-service =="
 gcloud run deploy ingest-service \
   --source=./ingest-service \
   --region="$REGION" \
@@ -117,7 +119,7 @@ gcloud pubsub topics add-iam-policy-binding "$TOPIC_ID" \
 
 INGEST_URL="$(gcloud run services describe ingest-service --region="$REGION" --format='value(status.url)')"
 echo ""
-echo "Listo."
+echo "Done."
 echo "Ingest URL: $INGEST_URL"
-echo "Probá con:"
+echo "Try it with:"
 echo "curl -X POST $INGEST_URL/records -H 'Content-Type: application/json' -d '{\"type\":\"blood_test\",\"value\":120,\"unit\":\"mg/dL\"}'"

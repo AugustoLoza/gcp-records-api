@@ -11,9 +11,9 @@ from db import get_connection
 
 app = FastAPI()
 
-# URL publica de este mismo servicio: es la "audience" esperada en el token
-# OIDC que Pub/Sub adjunta a cada push. La setea deploy.sh despues del
-# primer deploy (no se conoce la URL hasta que Cloud Run la asigna).
+# Public URL of this same service: it's the expected "audience" on the
+# OIDC token Pub/Sub attaches to every push. deploy.sh sets it after the
+# first deploy (the URL isn't known until Cloud Run assigns it).
 EXPECTED_AUDIENCE = os.environ["SERVICE_URL"]
 
 
@@ -40,9 +40,9 @@ async def pubsub_push(request: Request):
     conn = get_connection()
     try:
         cur = conn.cursor()
-        # ON CONFLICT DO NOTHING: Pub/Sub puede reentregar el mismo mensaje
-        # (at-least-once delivery). Sin esto, un reintento normal rompe con
-        # un error de primary key duplicada.
+        # ON CONFLICT DO NOTHING: Pub/Sub can redeliver the same message
+        # (at-least-once delivery). Without this, a normal retry would break
+        # with a duplicate primary key error.
         cur.execute(
             """
             INSERT INTO records (id, type, value, unit, ingested_at, processed_at)

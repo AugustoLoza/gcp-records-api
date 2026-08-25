@@ -9,8 +9,8 @@ from google.cloud import pubsub_v1
 
 app = FastAPI()
 
-# Config por variable de entorno, nunca hardcodeada (inyectada por Cloud Run
-# a partir de deploy.sh).
+# Config via environment variable, never hardcoded (injected by Cloud Run
+# from deploy.sh).
 PROJECT_ID = os.environ["GCP_PROJECT"]
 TOPIC_ID = os.environ["PUBSUB_TOPIC"]
 
@@ -35,13 +35,13 @@ def create_record(payload: RecordIn):
         "ingested_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # .result() espera el ack de Pub/Sub antes de responder al cliente:
-    # si Pub/Sub no confirma que recibio el mensaje, preferimos que el
-    # POST falle a que el cliente crea que se guardo algo que se perdio.
+    # .result() waits for Pub/Sub's ack before responding to the client:
+    # if Pub/Sub doesn't confirm it received the message, we'd rather the
+    # POST fail than have the client think something was saved that was lost.
     future = publisher.publish(topic_path, json.dumps(message).encode("utf-8"))
     future.result(timeout=10)
 
     print(f"Published record {record_id} to topic {TOPIC_ID}")
 
-    # 202, no 201: todavia no existe el recurso, solo aceptamos procesarlo.
+    # 202, not 201: the resource doesn't exist yet, we've only accepted it.
     return {"id": record_id, "status": "pending"}

@@ -1,18 +1,18 @@
 # Records API — GCP, event-driven
 
-API de ingesta de "resultados de salud", con procesamiento asíncrono real
-(Pub/Sub) sobre Postgres — pensada como práctica dirigida al stack de
-Function Health (Python en GCP, arquitecturas event-driven, Postgres).
+Health "results" ingestion API with real asynchronous processing (Pub/Sub)
+on top of Postgres — built as focused practice for a Python-on-GCP,
+event-driven-architecture, Postgres stack.
 
-## Arquitectura
+## Architecture
 
 ```
-Cliente
+Client
   |  POST /records
   v
-ingest-service (Cloud Run) --publica evento--> Pub/Sub (topic: records-ingested)
+ingest-service (Cloud Run) --publishes event--> Pub/Sub (topic: records-ingested)
                                                        |
-                                                       | push (con token OIDC)
+                                                       | push (OIDC token)
                                                        v
                                               processor-service (Cloud Run)
                                                        |
@@ -20,116 +20,118 @@ ingest-service (Cloud Run) --publica evento--> Pub/Sub (topic: records-ingested)
                                                    Postgres (Cloud SQL)
                                                        ^
                                                        |
-                                              GET /records/{id}  (mismo servicio)
+                                              GET /records/{id}  (same service)
 ```
 
-## Decisiones y por qué (el corazón del challenge)
+## Decisions and why (the heart of the project)
 
-- **ingest-service no toca la base de datos.** Solo valida el payload,
-  genera un `id` (UUID) y publica un evento en Pub/Sub. Responde
-  `202 Accepted`, no `201 Created`, porque el recurso todavía no existe —
-  solo aceptamos procesarlo. Esta separación es a propósito: es el patrón
-  de "clear service boundaries" que pide el rol. Si mañana el volumen de
-  ingesta se dispara, escalás el ingest sin tocar el processor, y viceversa.
+- **ingest-service never touches the database.** It only validates the
+  payload, generates an `id` (UUID), and publishes an event to Pub/Sub. It
+  responds `202 Accepted`, not `201 Created`, because the resource doesn't
+  exist yet — we've only accepted the request to process it. This separation
+  is deliberate: it's the "clear service boundaries" pattern. If ingestion
+  volume spikes tomorrow, you scale ingest without touching the processor,
+  and vice versa.
 
-- **Consistencia eventual, real.** Un `GET /records/{id}` justo después del
-  `POST` puede devolver 404 durante un instante, hasta que el processor lo
-  persista. No es un bug — es el trade-off explícito de desacoplar ingesta
-  de procesamiento. Un cliente bien diseñado hace polling con backoff, no
-  asume que el dato está disponible al instante.
+- **Real eventual consistency.** A `GET /records/{id}` right after the
+  `POST` can return 404 for a brief moment, until the processor persists it.
+  That's not a bug — it's the explicit trade-off of decoupling ingestion
+  from processing. A well-designed client polls with backoff instead of
+  assuming the data is available instantly.
 
-- **Idempotencia contra reentregas.** Pub/Sub garantiza *at-least-once
-  delivery*: el mismo mensaje puede llegar más de una vez. El INSERT usa
-  `ON CONFLICT (id) DO NOTHING` — reprocesar el mismo evento no rompe ni
-  duplica. Esto es "diseñar para reliability at scale", no un detalle de SQL.
+- **Idempotency against redelivery.** Pub/Sub guarantees *at-least-once
+  delivery*: the same message can arrive more than once. The INSERT uses
+  `ON CONFLICT (id) DO NOTHING` — reprocessing the same event neither breaks
+  nor duplicates anything. This is "designing for reliability at scale," not
+  a SQL detail.
 
-- **Postgres, no NoSQL.** A diferencia de la versión AWS (DynamoDB), acá el
-  esquema es fijo y relacional (`db/schema.sql`), con tipos (`NUMERIC` para
-  `value`, `TIMESTAMPTZ` para las fechas) — practicando justo lo que pide el
-  puesto: "relational modeling, query performance, data integrity".
+- **Postgres, not NoSQL.** Unlike the AWS version (DynamoDB), here the
+  schema is fixed and relational (`db/schema.sql`), with real types
+  (`NUMERIC` for `value`, `TIMESTAMPTZ` for dates) — practicing exactly what
+  the role asks for: "relational modeling, query performance, data
+  integrity."
 
-- **Autenticación servicio-a-servicio con OIDC, no un secreto compartido.**
-  `processor-service` verifica el JWT que Pub/Sub adjunta a cada push
-  (`id_token.verify_oauth2_token`), validando que venga realmente de la
-  suscripción de Pub/Sub y no de cualquiera que le pegue a `/pubsub/push`.
+- **Service-to-service auth via OIDC, not a shared secret.**
+  `processor-service` verifies the JWT that Pub/Sub attaches to every push
+  (`id_token.verify_oauth2_token`), confirming it really came from the
+  Pub/Sub subscription and not from anyone hitting `/pubsub/push` directly.
 
-- **Secrets en Secret Manager, no como env var plana.** La password de
-  Postgres se inyecta con `--set-secrets` (Secret Manager), no
-  `--set-env-vars`. Diferencia real: un env var normal se ve en la config
-  del servicio (`gcloud run services describe`) para cualquiera con permiso
-  de lectura; un secret de Secret Manager tiene su propio control de acceso
-  y queda auditado por separado.
+- **Secrets in Secret Manager, not a plain env var.** The Postgres password
+  is injected via `--set-secrets` (Secret Manager), not `--set-env-vars`.
+  Real difference: a plain env var is visible in the service config
+  (`gcloud run services describe`) to anyone with read access; a Secret
+  Manager secret has its own access control and is audited separately.
 
-- **`gcloud run deploy --source`, sin Docker local.** Esta máquina no tiene
-  Docker instalado — `--source` sube el código y lo builda con Cloud Build
-  en la nube. Útil para arrancar rápido; en un equipo real normalmente se
-  builda en CI (Cloud Build/GitHub Actions) de todos modos.
+- **`gcloud run deploy --source`, no local Docker.** This machine doesn't
+  have Docker installed — `--source` uploads the code and builds it with
+  Cloud Build in the cloud. Useful for getting started quickly; a real team
+  would typically build in CI (Cloud Build/GitHub Actions) anyway.
 
-## ⚠️ Costo: distinto a la versión AWS
+## ⚠️ Cost: different from the AWS version
 
-DynamoDB (versión AWS) tiene free tier permanente. **Cloud SQL no** — la
-instancia más chica (`db-f1-micro`) cuesta unos pocos dólares por día si
-queda corriendo. Para no gastar de más:
+DynamoDB (AWS version) has a permanent free tier. **Cloud SQL does not** —
+the smallest instance (`db-f1-micro`) costs a few dollars per day if left
+running. To avoid overspending:
 
 ```bash
-# Pausarla cuando no la estés usando:
+# Pause it when you're not using it:
 gcloud sql instances patch records-db --activation-policy=NEVER
-# Prenderla de nuevo:
+# Turn it back on:
 gcloud sql instances patch records-db --activation-policy=ALWAYS
-# Borrar todo al terminar el challenge:
+# Delete everything once you're done:
 gcloud sql instances delete records-db
 ```
 
-## Estructura
+## Structure
 
 ```
-db/schema.sql            # DDL de la tabla records
+db/schema.sql            # DDL for the records table
 ingest-service/
-  main.py                 # POST /records -> publica en Pub/Sub
+  main.py                 # POST /records -> publishes to Pub/Sub
   requirements.txt
   Dockerfile
 processor-service/
-  main.py                 # push handler de Pub/Sub + GET /records/{id}
-  db.py                    # conexión a Cloud SQL vía el connector oficial
+  main.py                 # Pub/Sub push handler + GET /records/{id}
+  db.py                    # Cloud SQL connection via the official connector
   requirements.txt
   Dockerfile
-deploy.sh                 # gcloud paso a paso (APIs, Cloud SQL, Pub/Sub, Cloud Run, IAM)
+deploy.sh                 # step-by-step gcloud (APIs, Cloud SQL, Pub/Sub, Cloud Run, IAM)
 ```
 
-## Cómo mapea a los requisitos del puesto
+## How this maps to typical job requirements
 
-| Requisito del job | Dónde está acá |
+| Requirement | Where it lives here |
 |---|---|
 | Python backend | `ingest-service`, `processor-service` (FastAPI) |
-| GCP: Pub/Sub, Cloud Run | Todo el stack |
-| Event-driven, colas, procesamiento async | Pub/Sub topic + push subscription entre los dos servicios |
-| Boundaries claros entre servicios | ingest nunca toca Postgres; processor nunca publica eventos |
-| Postgres, modelado relacional, integridad | `db/schema.sql`, `ON CONFLICT`, tipos explícitos |
-| Reliability a escala | Idempotencia, verificación de token, `202` vs `201` a propósito |
-| Ingesta → procesamiento → mostrar al usuario | Es literalmente el flujo `POST` → Pub/Sub → processor → `GET` |
+| GCP: Pub/Sub, Cloud Run | The whole stack |
+| Event-driven, queues, async processing | Pub/Sub topic + push subscription between the two services |
+| Clear boundaries between services | ingest never touches Postgres; processor never publishes events |
+| Postgres, relational modeling, integrity | `db/schema.sql`, `ON CONFLICT`, explicit types |
+| Reliability at scale | Idempotency, token verification, `202` vs `201` used deliberately |
+| Ingest → process → serve | This is literally the `POST` → Pub/Sub → processor → `GET` flow |
 
-Lo que falta para un espejo 100% completo (no crítico para el challenge):
-GraphQL (piden Postgres+GraphQL como bonus), Datadog real (acá son
-`print()` que van a Cloud Logging — el equivalente conceptual, pero no
-Datadog en sí), y tests automatizados.
+Not covered here (not critical for the exercise): GraphQL, real Datadog
+integration (logs here are `print()` statements going to Cloud Logging — the
+conceptual equivalent, but not Datadog itself), and automated tests for the
+deployed services.
 
-## Prerrequisitos
+## Prerequisites
 
-1. Cuenta de GCP con billing habilitado (crédito gratis de USD 300 por 90
-   días para cuentas nuevas — igual, ver el aviso de costo de Cloud SQL
-   arriba, ese crédito se agota).
-2. [gcloud CLI](https://cloud.google.com/sdk/docs/install) instalado, y
-   `gcloud auth login` corrido (abre el navegador, vos iniciás sesión, no yo).
-3. Un proyecto de GCP creado (`gcloud projects create tu-proyecto-id`).
+1. A GCP account with billing enabled (new accounts get $300 in free credit
+   for 90 days — still, see the Cloud SQL cost note above, that credit runs
+   out).
+2. [gcloud CLI](https://cloud.google.com/sdk/docs/install) installed, with
+   `gcloud auth login` already run (opens the browser, you sign in, not me).
+3. A GCP project created (`gcloud projects create your-project-id`).
 
 ## Deploy
 
 ```bash
-export PROJECT_ID=tu-proyecto-id
+export PROJECT_ID=your-project-id
 bash deploy.sh
 ```
 
-## Probar
+## Test it
 
 ```bash
 curl -X POST $INGEST_URL/records \
@@ -138,31 +140,32 @@ curl -X POST $INGEST_URL/records \
 # -> {"id": "...", "status": "pending"}
 
 curl $PROCESSOR_URL/records/<id>
-# puede dar 404 si todavia no proceso el evento; reintentar en 1-2s
+# may return 404 if the event hasn't been processed yet; retry in 1-2s
 ```
 
-## Troubleshooting real que nos encontramos
+## Real troubleshooting we ran into
 
-**`POST /pubsub/push` devuelve 401 aunque todo el IAM esté bien configurado.**
-Los logs mostraban que el push de Pub/Sub llegaba (confirmando topic,
-suscripción y el binding de `roles/run.invoker` correctos) pero
-`processor-service` lo rechazaba. Causa: por default, el `audience` del token
-OIDC que genera Pub/Sub es la **URL completa del push endpoint**
-(`.../pubsub/push`), no el origen del servicio. Nuestro código valida el
-token contra `SERVICE_URL` (sin el path) — mismatch, siempre 401. Se arregla
-seteando `--push-auth-token-audience` explícitamente en la suscripción (ya
-corregido en `deploy.sh`). Para diagnosticarlo sin adivinar: generamos un
-token real impersonando la cuenta de servicio de push
+**`POST /pubsub/push` returns 401 even though IAM looks correctly
+configured.** Logs showed the Pub/Sub push was arriving (confirming the
+topic, subscription, and `roles/run.invoker` binding were all correct), but
+`processor-service` was rejecting it. Root cause: by default, the `audience`
+claim on the OIDC token Pub/Sub generates is the **full push endpoint URL**
+(`.../pubsub/push`), not the service's origin. Our code validates the token
+against `SERVICE_URL` (no path) — mismatch, always 401. Fixed by explicitly
+setting `--push-auth-token-audience` on the subscription (already fixed in
+`deploy.sh`). To diagnose it without guessing: we minted a real token by
+impersonating the push service account
 (`gcloud auth print-identity-token --impersonate-service-account=... --audiences=...`)
-y lo mandamos a mano al endpoint — así separamos "¿bug en mi verificación?"
-de "¿bug en la config de Pub/Sub?" en vez de cambiar cosas a ciegas.
+and sent it to the endpoint by hand — separating "is my verification code
+wrong?" from "is the Pub/Sub config wrong?" instead of changing things
+blindly.
 
-**Cloud Run no puede leer el secret de Secret Manager al crear la revisión.**
-`Permission denied on secret ... for Revision service account
-PROJECT_NUMBER-compute@developer.gserviceaccount.com`. La cuenta de servicio
-por defecto de Cloud Run no tiene acceso a Secret Manager por default — hay
-que otorgarle `roles/secretmanager.secretAccessor` sobre el secret
-explícitamente (ya corregido en `deploy.sh`).
+**Cloud Run can't read the Secret Manager secret when creating the
+revision.** `Permission denied on secret ... for Revision service account
+PROJECT_NUMBER-compute@developer.gserviceaccount.com`. Cloud Run's default
+service account has no Secret Manager access by default — it needs
+`roles/secretmanager.secretAccessor` on the secret granted explicitly
+(already fixed in `deploy.sh`).
 
 ## Logs
 
