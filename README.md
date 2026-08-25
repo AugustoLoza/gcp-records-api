@@ -1,10 +1,6 @@
-# Records API — GCP, event-driven
+# Records API
 
-Health "results" ingestion API with real asynchronous processing (Pub/Sub)
-on top of Postgres — built as focused practice for a Python-on-GCP,
-event-driven-architecture, Postgres stack.
-
-## Architecture
+An event-driven ingestion API for health results (blood tests, vitals, etc.), built on Google Cloud Platform with two independently deployable services connected through Pub/Sub, backed by a managed Postgres database.
 
 ```
 Client
@@ -12,7 +8,7 @@ Client
   v
 ingest-service (Cloud Run) --publishes event--> Pub/Sub (topic: records-ingested)
                                                        |
-                                                       | push (OIDC token)
+                                                       | push (OIDC-signed)
                                                        v
                                               processor-service (Cloud Run)
                                                        |
@@ -23,153 +19,94 @@ ingest-service (Cloud Run) --publishes event--> Pub/Sub (topic: records-ingested
                                               GET /records/{id}  (same service)
 ```
 
-## Decisions and why (the heart of the project)
+## Overview
 
-- **ingest-service never touches the database.** It only validates the
-  payload, generates an `id` (UUID), and publishes an event to Pub/Sub. It
-  responds `202 Accepted`, not `201 Created`, because the resource doesn't
-  exist yet — we've only accepted the request to process it. This separation
-  is deliberate: it's the "clear service boundaries" pattern. If ingestion
-  volume spikes tomorrow, you scale ingest without touching the processor,
-  and vice versa.
+A client submits a health result via `POST /records`. Rather than writing to the database synchronously in the same request, the ingest service publishes an event and returns immediately — the write happens asynchronously in a separate service, which also serves reads once the record exists. This is the ingest → process → serve pattern used for pipelines where a data point needs to be accepted reliably before it's fully processed.
 
-- **Real eventual consistency.** A `GET /records/{id}` right after the
-  `POST` can return 404 for a brief moment, until the processor persists it.
-  That's not a bug — it's the explicit trade-off of decoupling ingestion
-  from processing. A well-designed client polls with backoff instead of
-  assuming the data is available instantly.
+**Stack:** Python (FastAPI) · Google Cloud Run · Pub/Sub · Cloud SQL (Postgres) · Secret Manager · IAM
 
-- **Idempotency against redelivery.** Pub/Sub guarantees *at-least-once
-  delivery*: the same message can arrive more than once. The INSERT uses
-  `ON CONFLICT (id) DO NOTHING` — reprocessing the same event neither breaks
-  nor duplicates anything. This is "designing for reliability at scale," not
-  a SQL detail.
+## API
 
-- **Postgres, not NoSQL.** Unlike the AWS version (DynamoDB), here the
-  schema is fixed and relational (`db/schema.sql`), with real types
-  (`NUMERIC` for `value`, `TIMESTAMPTZ` for dates) — practicing exactly what
-  the role asks for: "relational modeling, query performance, data
-  integrity."
+**`POST /records`**
+```json
+{ "type": "blood_test", "value": 120, "unit": "mg/dL" }
+```
+→ `202 Accepted`
+```json
+{ "id": "e3b0c442-...", "status": "pending" }
+```
+The record doesn't exist yet at response time — only the request to process it has been accepted.
 
-- **Service-to-service auth via OIDC, not a shared secret.**
-  `processor-service` verifies the JWT that Pub/Sub attaches to every push
-  (`id_token.verify_oauth2_token`), confirming it really came from the
-  Pub/Sub subscription and not from anyone hitting `/pubsub/push` directly.
+**`GET /records/{id}`**
+→ `200 OK` once processed:
+```json
+{
+  "id": "e3b0c442-...",
+  "type": "blood_test",
+  "value": 120.0,
+  "unit": "mg/dL",
+  "ingested_at": "2026-08-19T03:16:51.362673+00:00",
+  "processed_at": "2026-08-19T03:16:51.926293+00:00"
+}
+```
+→ `404` if the event hasn't been processed yet (see [Eventual consistency](#eventual-consistency) below).
 
-- **Secrets in Secret Manager, not a plain env var.** The Postgres password
-  is injected via `--set-secrets` (Secret Manager), not `--set-env-vars`.
-  Real difference: a plain env var is visible in the service config
-  (`gcloud run services describe`) to anyone with read access; a Secret
-  Manager secret has its own access control and is audited separately.
+## Design decisions
 
-- **`gcloud run deploy --source`, no local Docker.** This machine doesn't
-  have Docker installed — `--source` uploads the code and builds it with
-  Cloud Build in the cloud. Useful for getting started quickly; a real team
-  would typically build in CI (Cloud Build/GitHub Actions) anyway.
+**Services split by responsibility, not by convenience.** `ingest-service` validates input, generates an id, and publishes to Pub/Sub — it never opens a database connection, at the code level or the IAM level. `processor-service` is the only thing that writes to or reads from Postgres. Each runs as its own Cloud Run service with its own service account, scoped to only the permission it needs (publish-only for ingest, Cloud SQL + one secret for the processor). Either can be scaled, redeployed, or taken down without the other noticing.
 
-## ⚠️ Cost: different from the AWS version
+**Eventual consistency, handled deliberately.** Because persistence is decoupled from ingestion, a `GET` immediately after a `POST` can briefly return 404 before the processor catches up — typically under a second, longer on a cold start. This is surfaced explicitly (`202 Accepted`, not `201 Created`) rather than papered over, and a client is expected to poll with backoff rather than assume synchronous availability.
 
-DynamoDB (AWS version) has a permanent free tier. **Cloud SQL does not** —
-the smallest instance (`db-f1-micro`) costs a few dollars per day if left
-running. To avoid overspending:
+**Idempotent writes.** Pub/Sub guarantees *at-least-once* delivery, so the same event can be redelivered. The insert uses `ON CONFLICT (id) DO NOTHING`, making redelivery a safe no-op instead of a duplicate row or a crash.
+
+**Relational schema, explicit types.** Postgres over a document store, with `NUMERIC` for measurement values and `TIMESTAMPTZ` for timestamps — a fixed, typed schema rather than an implicit one.
+
+**Service-to-service auth via OIDC, not a shared secret.** `processor-service` verifies the identity token Pub/Sub attaches to every push request (`google.oauth2.id_token.verify_oauth2_token`), confirming each request actually originates from the subscription rather than trusting anything that hits the endpoint.
+
+**Secrets via Secret Manager, not plain environment variables.** The database password is injected with `--set-secrets`, which carries its own access control and audit trail — distinct from a plain `--set-env-vars` value, which is visible to anyone with read access to the service configuration.
+
+## Engineering challenges
+
+**OIDC audience mismatch caused every Pub/Sub push to fail with 401**, despite correct IAM bindings. By default, the `audience` claim on the token Pub/Sub generates is the full push endpoint URL (including the path), not the service's origin — which is what the verification code checked against. Diagnosed by minting a real identity token via service account impersonation and calling the endpoint directly, isolating "bug in the verification code" from "bug in the Pub/Sub subscription config" before changing anything. Fixed with an explicit `--push-auth-token-audience` on the subscription.
+
+**Cloud Run couldn't read its own secret on deploy.** The default Compute Engine service account has no Secret Manager access by default; granting a secret reference in the deploy command isn't the same as granting the runtime identity permission to read it. Fixed with an explicit `secretAccessor` IAM binding.
+
+## Cost note
+
+Cloud Run, Pub/Sub, and Secret Manager all scale to zero and cost nothing while idle. Cloud SQL does not — it behaves like an always-on instance and bills hourly regardless of traffic. Pause it when not in active use:
 
 ```bash
-# Pause it when you're not using it:
-gcloud sql instances patch records-db --activation-policy=NEVER
-# Turn it back on:
-gcloud sql instances patch records-db --activation-policy=ALWAYS
-# Delete everything once you're done:
-gcloud sql instances delete records-db
+gcloud sql instances patch records-db --activation-policy=NEVER   # pause
+gcloud sql instances patch records-db --activation-policy=ALWAYS  # resume
+gcloud sql instances delete records-db                            # tear down
 ```
 
-## Structure
+## Project structure
 
 ```
-db/schema.sql            # DDL for the records table
+db/schema.sql            # records table DDL
 ingest-service/
   main.py                 # POST /records -> publishes to Pub/Sub
-  requirements.txt
   Dockerfile
 processor-service/
   main.py                 # Pub/Sub push handler + GET /records/{id}
   db.py                    # Cloud SQL connection via the official connector
-  requirements.txt
   Dockerfile
-deploy.sh                 # step-by-step gcloud (APIs, Cloud SQL, Pub/Sub, Cloud Run, IAM)
+deploy.sh                 # end-to-end gcloud deploy (APIs, Cloud SQL, Pub/Sub, Cloud Run, IAM)
+agent/                    # a small self-correcting coding agent — see agent/README.md
 ```
 
-## How this maps to typical job requirements
+## Running it
 
-| Requirement | Where it lives here |
-|---|---|
-| Python backend | `ingest-service`, `processor-service` (FastAPI) |
-| GCP: Pub/Sub, Cloud Run | The whole stack |
-| Event-driven, queues, async processing | Pub/Sub topic + push subscription between the two services |
-| Clear boundaries between services | ingest never touches Postgres; processor never publishes events |
-| Postgres, relational modeling, integrity | `db/schema.sql`, `ON CONFLICT`, explicit types |
-| Reliability at scale | Idempotency, token verification, `202` vs `201` used deliberately |
-| Ingest → process → serve | This is literally the `POST` → Pub/Sub → processor → `GET` flow |
-
-Not covered here (not critical for the exercise): GraphQL, real Datadog
-integration (logs here are `print()` statements going to Cloud Logging — the
-conceptual equivalent, but not Datadog itself), and automated tests for the
-deployed services.
-
-## Prerequisites
-
-1. A GCP account with billing enabled (new accounts get $300 in free credit
-   for 90 days — still, see the Cloud SQL cost note above, that credit runs
-   out).
-2. [gcloud CLI](https://cloud.google.com/sdk/docs/install) installed, with
-   `gcloud auth login` already run (opens the browser, you sign in, not me).
-3. A GCP project created (`gcloud projects create your-project-id`).
-
-## Deploy
+**Prerequisites:** a GCP project with billing enabled, and the [gcloud CLI](https://cloud.google.com/sdk/docs/install) installed and authenticated (`gcloud auth login`).
 
 ```bash
 export PROJECT_ID=your-project-id
 bash deploy.sh
 ```
 
-## Test it
+`deploy.sh` walks through enabling APIs, provisioning Cloud SQL, storing the database password in Secret Manager, creating the Pub/Sub topic and push subscription, and deploying both Cloud Run services with least-privilege IAM bindings.
 
-```bash
-curl -X POST $INGEST_URL/records \
-  -H "Content-Type: application/json" \
-  -d '{"type":"blood_test","value":120,"unit":"mg/dL"}'
-# -> {"id": "...", "status": "pending"}
+## Not included
 
-curl $PROCESSOR_URL/records/<id>
-# may return 404 if the event hasn't been processed yet; retry in 1-2s
-```
-
-## Real troubleshooting we ran into
-
-**`POST /pubsub/push` returns 401 even though IAM looks correctly
-configured.** Logs showed the Pub/Sub push was arriving (confirming the
-topic, subscription, and `roles/run.invoker` binding were all correct), but
-`processor-service` was rejecting it. Root cause: by default, the `audience`
-claim on the OIDC token Pub/Sub generates is the **full push endpoint URL**
-(`.../pubsub/push`), not the service's origin. Our code validates the token
-against `SERVICE_URL` (no path) — mismatch, always 401. Fixed by explicitly
-setting `--push-auth-token-audience` on the subscription (already fixed in
-`deploy.sh`). To diagnose it without guessing: we minted a real token by
-impersonating the push service account
-(`gcloud auth print-identity-token --impersonate-service-account=... --audiences=...`)
-and sent it to the endpoint by hand — separating "is my verification code
-wrong?" from "is the Pub/Sub config wrong?" instead of changing things
-blindly.
-
-**Cloud Run can't read the Secret Manager secret when creating the
-revision.** `Permission denied on secret ... for Revision service account
-PROJECT_NUMBER-compute@developer.gserviceaccount.com`. Cloud Run's default
-service account has no Secret Manager access by default — it needs
-`roles/secretmanager.secretAccessor` on the secret granted explicitly
-(already fixed in `deploy.sh`).
-
-## Logs
-
-```bash
-gcloud run services logs read ingest-service --region=$REGION
-gcloud run services logs read processor-service --region=$REGION
-```
+GraphQL, authentication/authorization on the API itself, structured metrics (logs go to Cloud Logging via `print()`, not a full observability stack), and automated tests for the deployed services. `agent/` has its own test suite and self-correcting verification loop, covered separately in [`agent/README.md`](agent/README.md).
